@@ -258,3 +258,63 @@ test_that("a column changes its type (#2998)", {
     c("0", "1", "2")
   )
 })
+
+test_that("a registered relation's list column binds off R's thread when R's thread serves calls", {
+  skip_if(getRversion() < "4.3", "ALTREP for lists not supported")
+
+  con <- local_con()
+  con_rel <- local_con()
+  df <- rel_to_altrep(rel_from_sql(
+    con_rel,
+    "SELECT * FROM (VALUES (1, [1, 2]), (2, [3])) t(a, l)"
+  ))
+  duckdb_register(con, "r", df)
+
+  withr::local_options(duckdb.serve_r_calls = TRUE)
+  expect_identical(query_off_r_thread(con, "SELECT a FROM r"), NA_character_)
+  expect_identical(dbGetQuery(con, "SELECT len(l) AS n FROM r ORDER BY a")$n, c(2, 1))
+})
+
+test_that("a query that serves calls for R's thread returns what it returns otherwise", {
+  con <- local_con()
+  dbExecute(con, "SET threads = 4")
+  dbExecute(con, "CREATE TABLE t AS SELECT i, i % 7 AS g FROM range(200000) t(i)")
+  sql <- "SELECT g, count(*) AS n, sum(i) AS s FROM t GROUP BY g ORDER BY g"
+
+  expected <- dbGetQuery(con, sql)
+  withr::local_options(duckdb.serve_r_calls = TRUE)
+  expect_identical(dbGetQuery(con, sql), expected)
+  expect_error(dbGetQuery(con, "SELECT nope FROM t"), "nope")
+  expect_identical(dbExecute(con, "INSERT INTO t VALUES (1, 1)"), 1)
+})
+
+test_that("engine threads run an R function through R's thread while a query serves calls", {
+  con <- local_con()
+  register_test_call(con)
+  dbExecute(con, "SET threads = 4")
+  dbExecute(con, "CREATE TABLE t AS SELECT i FROM range(400000) t(i)")
+  sql <- "SELECT sum(duckdb_r_test_call()) AS s, count(*) AS n FROM t"
+
+  calls <- 0L
+  r_pid <- Sys.getpid()
+  withr::local_options(duckdb.test_call = function() {
+    stopifnot(Sys.getpid() == r_pid)
+    calls <<- calls + 1L
+    # A collection here may finalize connections: it must not wait for this query
+    invisible(gc())
+  })
+  local({
+    dbConnect(duckdb())
+    dbSendQuery(con, "SELECT 42")
+    NULL
+  })
+
+  withr::local_options(duckdb.serve_r_calls = TRUE)
+  out <- suppressWarnings(dbGetQuery(con, sql))
+  expect_identical(out$s, 400000)
+  expect_identical(out$n, 400000)
+  expect_gt(calls, 1L)
+
+  withr::local_options(duckdb.test_call = function() stop("boom"))
+  expect_error(dbGetQuery(con, sql), "boom")
+})

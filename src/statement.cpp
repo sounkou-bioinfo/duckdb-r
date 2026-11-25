@@ -62,8 +62,9 @@ void RCallbackScope::Park(duckdb::unique_ptr<ParkedBase> object) {
 void RCallbackScope::Drain() {
 	// A query that R's thread is executing holds its client context lock too. R code that an extension
 	// runs underneath it, such as a function implemented in R, is no callback of ours, and a finalizer
-	// may disconnect or shut down there. The next entry point drains.
-	if (Active() || ScopedInterruptHandler::IsActive()) {
+	// may disconnect or shut down there. While R's thread serves calls, the thread that waits for it may
+	// hold such a lock as well. The next entry point drains.
+	if (Active() || ScopedInterruptHandler::IsActive() || RThreadServing()) {
 		return;
 	}
 	// Swap first: destroying a statement runs duckdb code, which may register
@@ -451,6 +452,29 @@ static void CheckResultTypeForR(const LogicalType &type, const string &name) {
 	}
 }
 
+bool duckdb::ServeRCallsOption() {
+	SEXP option = Rf_GetOption1(Rf_install("duckdb.serve_r_calls"));
+	return TYPEOF(option) == LGLSXP && Rf_xlength(option) == 1 && LOGICAL(option)[0] == TRUE;
+}
+
+// Completes a submitted query on R's thread, one task at a time, and runs the calls that other threads
+// queued for R between the tasks. The client context lock is held only inside ExecuteTask().
+static void CompleteServingRCalls(QueryResult &result) {
+	RThreadServer server;
+	result.Materialize();
+	while (true) {
+		ServeRThreadCalls(0);
+		auto state = result.ExecuteTask();
+		if (IsTerminal(state)) {
+			break;
+		}
+		if (state != QueryResultState::NOT_READY) {
+			// The remaining tasks run on other threads: wait for a call from one of them
+			ServeRThreadCalls(1);
+		}
+	}
+}
+
 static SEXP rapi_execute_impl(RStatement *stmt, const duckdb::ConvertOpts &convert_opts, bool allow_stream_result) {
 	// Only the conversion to R vectors needs the check: an Arrow result carries every type.
 	if (convert_opts.arrow != ConvertOpts::ArrowConversion::ENABLED) {
@@ -482,6 +506,11 @@ static SEXP rapi_execute_impl(RStatement *stmt, const duckdb::ConvertOpts &conve
 			if (!streamed) {
 				generic_result->Complete();
 			}
+		}
+	} else if (ServeRCallsOption()) {
+		generic_result = stmt->stmt->Submit(stmt->parameters);
+		if (!generic_result->HasError()) {
+			CompleteServingRCalls(*generic_result);
 		}
 	} else {
 		generic_result = stmt->stmt->Execute(stmt->parameters);

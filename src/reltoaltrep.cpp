@@ -1365,5 +1365,6 @@ shared_ptr<AltrepRelationWrapper> rapi_rel_wrapper_from_altrep_df(SEXP df, bool 
 	// clang-format on
 	// R calls the init hooks on its own thread when it loads the package
 	RecordRThread();
+	RegisterRApi();
 	RelToAltrep::Initialize(dll);
 }

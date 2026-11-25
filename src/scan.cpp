@@ -4,6 +4,9 @@
 #include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "rapi.hpp"
+#include "duckdb/execution/executor.hpp"
+
+#include <cstdio>
 #include "reltoaltrep.hpp"
 #include "typesr.hpp"
 
@@ -688,6 +691,42 @@ static duckdb::unique_ptr<FunctionData> DataFrameScanBind(ClientContext &context
 	// The binder holds the client context lock across this, and touching an ALTREP column
 	// runs its class's code: a duckdb relation materializes, after evaluating
 	// `duckdb.materialize_callback` -- arbitrary R code, and with it pending finalizers.
+	if (!OnRThread()) {
+		// The bind builds cpp11 vectors and may run R code: R's thread runs it when it serves calls.
+		// Otherwise this thread binds, and reads only what is in memory already.
+		struct BindCall {
+			ClientContext &context;
+			TableFunctionBindInput &input;
+			vector<LogicalType> &return_types;
+			vector<Identifier> &names;
+			duckdb::unique_ptr<FunctionData> result;
+		};
+		BindCall bind_call {context, input, return_types, names, nullptr};
+		char bind_error[512];
+		auto bound = RunOnRThread(
+		    [](void *call_p, char *err, size_t cap) {
+			    auto &call = *static_cast<BindCall *>(call_p);
+			    try {
+				    call.result = DataFrameScanBind(call.context, call.input, call.return_types, call.names);
+			    } catch (std::exception &ex) {
+				    std::snprintf(err, cap, "%s", ErrorData(ex).RawMessage().c_str());
+				    return 1;
+			    }
+			    return 0;
+		    },
+		    &bind_call, bind_error, sizeof(bind_error),
+		    [](void *context_p) -> int {
+			    auto &query = *static_cast<ClientContext *>(context_p);
+			    return query.IsInterrupted() || query.GetExecutor().HasError();
+		    },
+		    &context);
+		if (bound == 0) {
+			return std::move(bind_call.result);
+		}
+		if (bound == 1) {
+			throw InvalidInputException(bind_error);
+		}
+	}
 	RCallbackScope callback_scope;
 
 	data_frame df((SEXP)input.inputs[0].GetPointer());

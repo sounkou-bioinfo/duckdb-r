@@ -229,7 +229,7 @@ public:
 		Park(duckdb::make_uniq<Parked<T>>(std::move(object)));
 	}
 	//! Destroy everything parked so far, in the order it was parked;
-	//! a no-op while Active(), and while R's thread executes a query
+	//! a no-op while Active(), while R's thread executes a query, and while it serves calls of other threads
 	static void Drain();
 
 	struct ParkedBase {
@@ -251,6 +251,27 @@ private:
 bool OnRThread();
 //! Records the calling thread as R's; called once, when R loads the package.
 void RecordRThread();
+
+//! Runs `fn` on R's thread: inline there, queued from any other thread, whose caller blocks until R's thread
+//! ran it. Returns a DUCKDB_R_CALL_* code of inst/include/duckdb_r_api.h (src/dispatch.cpp).
+//! With `cancelled`, the waiting thread asks it every few ms, and withdraws a call that R's thread has not started.
+int RunOnRThread(int (*fn)(void *data, char *err, size_t cap), void *data, char *err, size_t cap,
+                 int (*cancelled)(void *cancel_data) = nullptr, void *cancel_data = nullptr);
+//! R's thread only: runs the queued calls, after waiting up to `wait_ms` for the first one.
+idx_t ServeRThreadCalls(int wait_ms);
+//! Whether R's thread serves queued calls now: a thread that waits for R may hold a client context lock.
+bool RThreadServing();
+//! While one lives, R's thread serves queued calls; without one, a queued call fails at once.
+struct RThreadServer {
+	RThreadServer();
+	~RThreadServer();
+	RThreadServer(const RThreadServer &) = delete;
+	RThreadServer &operator=(const RThreadServer &) = delete;
+};
+//! Registers the `duckdb_r_api_v1` C-callable; called once, when R loads the package.
+void RegisterRApi();
+//! R's thread only: whether options(duckdb.serve_r_calls = TRUE) is set.
+bool ServeRCallsOption();
 
 struct RStatement {
 	RStatement() = delete;

@@ -1,11 +1,14 @@
 #include "cpp11/environment.hpp"
 #include "duckdb/common/enum_util.hpp"
+#include "duckdb/execution/executor.hpp"
+#include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "r_progress_bar_display.hpp"
 #include "rapi.hpp"
 
+#include <atomic>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -59,10 +62,22 @@ void RProgressBarDisplay::Initialize() {
 	}
 }
 
-// The engine builds the display when a query starts, on the thread that issues it, which is R's.
+// The engine builds the display when a query starts, on the thread that issues it. That is R's for a DBI
+// call. For a query issued on another thread, R's thread looks the callback up when it serves calls, and
+// the display stays silent otherwise.
 RProgressBarDisplay::RProgressBarDisplay() : ProgressBarDisplay() {
-	ReleaseOrphanedCallbacks();
-	Initialize();
+	char error[1];
+	RunOnRThread(
+	    [](void *display, char *, size_t) {
+		    try {
+			    ReleaseOrphanedCallbacks();
+			    static_cast<RProgressBarDisplay *>(display)->Initialize();
+		    } catch (...) {
+			    return 1;
+		    }
+		    return 0;
+	    },
+	    this, error, sizeof(error));
 }
 
 RProgressBarDisplay::~RProgressBarDisplay() {
@@ -151,8 +166,10 @@ static void SetDefaultConfigArguments(ClientContext &context) {
 	return !conn->conn->IsAutoCommit();
 }
 
-// Test-only, unexported: runs a query on a thread of its own while R's thread only waits for it,
-// so the query binds, and runs, off R's thread every time (#2962). Returns the error message, or NA.
+// Test-only, unexported: runs a query on a thread of its own, so the query binds, and runs, off R's thread
+// every time (#2962). R's thread only waits for it, or with options(duckdb.serve_r_calls = TRUE) serves the
+// calls that thread queues for R.
+// Returns the error message, or NA.
 [[cpp11::register]] SEXP rapi_query_off_r_thread(duckdb::conn_eptr_t conn, std::string sql) {
 	if (!conn || !conn.get() || !conn->conn) {
 		rapi_error_with_context("rapi_query_off_r_thread", "Invalid connection");
@@ -160,6 +177,12 @@ static void SetDefaultConfigArguments(ClientContext &context) {
 	auto &connection = *conn->conn;
 	bool failed = false;
 	string message;
+	std::atomic<bool> finished {false};
+	// Serving starts before the thread does, so its first call for R finds a server
+	duckdb::unique_ptr<RThreadServer> server;
+	if (ServeRCallsOption()) {
+		server = make_uniq<RThreadServer>();
+	}
 	std::thread worker([&]() {
 		try {
 			auto result = connection.Query(sql);
@@ -175,7 +198,11 @@ static void SetDefaultConfigArguments(ClientContext &context) {
 			failed = true;
 			message = "unknown error";
 		}
+		finished = true;
 	});
+	while (server && !finished) {
+		ServeRThreadCalls(1);
+	}
 	worker.join();
 	if (!failed) {
 		return Rf_ScalarString(NA_STRING);
@@ -226,21 +253,41 @@ static void SetDefaultConfigArguments(ClientContext &context) {
 }
 
 // Test-only, unexported: registers `duckdb_r_test_call()`, a scalar function that calls the R function
-// in `options(duckdb.test_call)`. It stands in for an extension whose functions run R code on R's thread
-// under a running query, outside any callback of this package.
+// in `options(duckdb.test_call)` through RunOnRThread(). It stands in for an extension whose functions
+// run R code under a running query, outside any callback of this package, from any engine thread.
 [[cpp11::register]] void rapi_register_test_call(duckdb::conn_eptr_t conn) {
 	if (!conn || !conn.get() || !conn->conn) {
 		rapi_error_with_context("rapi_register_test_call", "Invalid connection");
 	}
 	ScalarFunction function("duckdb_r_test_call", {}, LogicalType::INTEGER,
-	                        [](DataChunk &args, ExpressionState &, Vector &result) {
-		                        if (!OnRThread()) {
-			                        throw InvalidInputException("duckdb_r_test_call() runs on R's thread only");
-		                        }
-		                        SEXP fn = Rf_GetOption1(Rf_install("duckdb.test_call"));
-		                        if (Rf_isFunction(fn)) {
-			                        cpp11::sexp call = Rf_lang1(fn);
-			                        cpp11::safe[Rf_eval](call, R_GlobalEnv);
+	                        [](DataChunk &args, ExpressionState &state, Vector &result) {
+		                        // Any thread: R's thread runs the R function, inline or when it serves calls.
+		                        // A failed or interrupted query withdraws the call: R's thread then waits for this task.
+		                        auto &context = state.GetContext();
+		                        char error[256];
+		                        auto status = RunOnRThread(
+		                            [](void *, char *err, size_t cap) {
+			                            SEXP fn = Rf_GetOption1(Rf_install("duckdb.test_call"));
+			                            if (!Rf_isFunction(fn)) {
+				                            return 0;
+			                            }
+			                            SEXP call = PROTECT(Rf_lang1(fn));
+			                            int failed = 0;
+			                            R_tryEvalSilent(call, R_GlobalEnv, &failed);
+			                            UNPROTECT(1);
+			                            if (failed) {
+				                            std::snprintf(err, cap, "%s", R_curErrorBuf());
+			                            }
+			                            return failed;
+		                            },
+		                            nullptr, error, sizeof(error),
+		                            [](void *context_p) -> int {
+		                                auto &query = *static_cast<ClientContext *>(context_p);
+		                                return query.IsInterrupted() || query.GetExecutor().HasError();
+		                            },
+		                            &context);
+		                        if (status != 0) {
+			                        throw InvalidInputException("duckdb_r_test_call(): %s", error);
 		                        }
 		                        result.Reference(Value::INTEGER(1), count_t(args.size()));
 	                        });
