@@ -75,3 +75,32 @@ test_that("disconnect releases a result parked during an R callback (#2934)", {
     list(db_path = db_path, pkg = pkg)
   ))
 })
+
+test_that("a connection finalized while R code runs under a query does not wait for that query", {
+  pkg <- get_package_name()
+
+  # In a process of its own: the failure is a thread that waits for a lock it holds.
+  out <- callr::r(
+    function(pkg) {
+      ns <- asNamespace(pkg)
+      con <- DBI::dbConnect(ns$duckdb())
+      DBI::dbExecute(con, "SET threads = 1")
+      ns$register_test_call(con)
+      local({
+        # Never disconnected: its finalizer disconnects, wherever the collection runs
+        DBI::dbConnect(ns$duckdb())
+        # Never cleared: its finalizer parks the result, which holds the context of `con`
+        DBI::dbSendQuery(con, "SELECT 42")
+        NULL
+      })
+      # R code that the engine runs under a query of `con`, outside any callback of the package
+      options(duckdb.test_call = function() invisible(gc()))
+      out <- suppressWarnings(DBI::dbGetQuery(con, "SELECT duckdb_r_test_call() AS x")$x)
+      DBI::dbDisconnect(con)
+      out
+    },
+    list(pkg = pkg),
+    timeout = 120
+  )
+  expect_identical(out, 1L)
+})

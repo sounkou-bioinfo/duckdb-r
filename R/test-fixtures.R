@@ -37,3 +37,15 @@ local_con <- function(..., drv = duckdb()) {
 query_off_r_thread <- function(con, sql) {
   rethrow_rapi_query_off_r_thread(con@conn_ref, sql)
 }
+
+#' Register `duckdb_r_test_call()`, a function that runs R code under a query
+#'
+#' Test-only: the SQL function calls the R function in
+#' `options(duckdb.test_call)` on R's thread, the way a function that an
+#' extension implements in R does. Use with `SET threads = 1`.
+#'
+#' @param con A DuckDB connection
+#' @noRd
+register_test_call <- function(con) {
+  rethrow_rapi_register_test_call(con@conn_ref)
+}

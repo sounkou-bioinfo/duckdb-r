@@ -1,6 +1,8 @@
 #include "cpp11/environment.hpp"
 #include "duckdb/common/enum_util.hpp"
+#include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "r_progress_bar_display.hpp"
 #include "rapi.hpp"
 
@@ -132,7 +134,7 @@ static void SetDefaultConfigArguments(ClientContext &context) {
 [[cpp11::register]] void rapi_disconnect(duckdb::conn_eptr_t conn) {
 	// An object parked during the last R callback holds its client context, and with it the database:
 	// destroy it before letting go of the connection, or the file stays open (#2934).
-	// A no-op inside a callback, as everywhere: a finalizer may disconnect there.
+	// A no-op inside a callback and under a running query, as everywhere: a finalizer may disconnect there.
 	RCallbackScope::Drain();
 	auto conn_wrapper = conn.release();
 	if (conn_wrapper) {
@@ -221,4 +223,29 @@ static void SetDefaultConfigArguments(ClientContext &context) {
 
 	// All checks passed - connection appears valid
 	return true;
+}
+
+// Test-only, unexported: registers `duckdb_r_test_call()`, a scalar function that calls the R function
+// in `options(duckdb.test_call)`. It stands in for an extension whose functions run R code on R's thread
+// under a running query, outside any callback of this package.
+[[cpp11::register]] void rapi_register_test_call(duckdb::conn_eptr_t conn) {
+	if (!conn || !conn.get() || !conn->conn) {
+		rapi_error_with_context("rapi_register_test_call", "Invalid connection");
+	}
+	ScalarFunction function("duckdb_r_test_call", {}, LogicalType::INTEGER,
+	                        [](DataChunk &args, ExpressionState &, Vector &result) {
+		                        if (!OnRThread()) {
+			                        throw InvalidInputException("duckdb_r_test_call() runs on R's thread only");
+		                        }
+		                        SEXP fn = Rf_GetOption1(Rf_install("duckdb.test_call"));
+		                        if (Rf_isFunction(fn)) {
+			                        cpp11::sexp call = Rf_lang1(fn);
+			                        cpp11::safe[Rf_eval](call, R_GlobalEnv);
+		                        }
+		                        result.Reference(Value::INTEGER(1), count_t(args.size()));
+	                        });
+	function.SetVolatile();
+	function.SetFallible();
+	CreateScalarFunctionInfo info(std::move(function));
+	conn->conn->context->RegisterFunction(info);
 }

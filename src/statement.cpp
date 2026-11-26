@@ -60,7 +60,10 @@ void RCallbackScope::Park(duckdb::unique_ptr<ParkedBase> object) {
 // duckdb call that made the callback, which still holds the lock. Draining has
 // to wait for an entry point, where R is the caller and nothing is held.
 void RCallbackScope::Drain() {
-	if (Active()) {
+	// A query that R's thread is executing holds its client context lock too. R code that an extension
+	// runs underneath it, such as a function implemented in R, is no callback of ours, and a finalizer
+	// may disconnect or shut down there. The next entry point drains.
+	if (Active() || ScopedInterruptHandler::IsActive()) {
 		return;
 	}
 	// Swap first: destroying a statement runs duckdb code, which may register

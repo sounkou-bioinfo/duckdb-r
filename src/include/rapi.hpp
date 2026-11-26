@@ -228,7 +228,8 @@ public:
 	static void Defer(T object) {
 		Park(duckdb::make_uniq<Parked<T>>(std::move(object)));
 	}
-	//! Destroy everything parked so far, in the order it was parked; a no-op while Active()
+	//! Destroy everything parked so far, in the order it was parked;
+	//! a no-op while Active(), and while R's thread executes a query
 	static void Drain();
 
 	struct ParkedBase {

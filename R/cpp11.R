@@ -44,6 +44,10 @@ rapi_query_off_r_thread <- function(conn, sql) {
   .Call(`_duckdb_rapi_query_off_r_thread`, conn, sql)
 }
 
+rapi_register_test_call <- function(conn) {
+  invisible(.Call(`_duckdb_rapi_register_test_call`, conn))
+}
+
 rapi_connection_set_invalidation_policy <- function(conn, policy) {
   .Call(`_duckdb_rapi_connection_set_invalidation_policy`, conn, policy)
 }
